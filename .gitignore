@@ -1,0 +1,19 @@
+# VSCode
+.vscode/
+
+# Logs e temporários
+*.log
+*.tmp
+*.bak
+
+# Artefatos/saídas comuns
+out/
+bin/
+obj/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# PowerShell - às vezes surgem históricos/transcripts
+*.clixml
