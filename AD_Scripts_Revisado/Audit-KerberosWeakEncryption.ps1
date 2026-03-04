@@ -9,7 +9,10 @@
     Active Directory.
 
     Fluxo de execução:
-      1. Menu de seleção do escopo: Floresta completa ou domínio específico.
+      1. Menu de seleção do escopo: Floresta completa, domínio específico ou
+         apenas o servidor local (onde o script está sendo executado).
+         - Modo "Servidor Atual" [L]: auditpol e Get-WinEvent rodam localmente,
+           sem necessidade de WinRM ou acesso remoto.
       2. Para cada DC selecionado, valida se a auditoria Kerberos está habilitada.
          - Se NÃO estiver: alerta o administrador, grava o DC em TXT e passa ao próximo.
       3. Para cada DC com auditoria ativa, coleta eventos 4768/4769 (últimos 30 dias)
@@ -27,7 +30,7 @@
       4769 → Kerberos Service Ticket Request (TGS)
 
 .NOTES
-    Versão        : 1.0
+    Versão        : 1.1
     Pré-requisitos: PowerShell 5.1+, módulo RSAT-ActiveDirectory,
                     acesso remoto (RPC/DCOM) ao Event Log dos DCs,
                     permissão de leitura do Security Event Log nos DCs.
@@ -181,12 +184,15 @@ function Show-ScopeMenu {
     <#
     .SYNOPSIS
         Exibe menu interativo para o administrador selecionar o escopo de análise:
-        toda a floresta AD ou um domínio específico.
+        toda a floresta AD, um domínio específico ou apenas o servidor local.
     .OUTPUTS
-        [string[]] Array com os nomes de domínio a analisar.
+        [PSCustomObject] com:
+          Mode        [string]   — 'Forest' | 'Domain' | 'Local'
+          Domains     [string[]] — domínios selecionados (vazio em modo Local)
+          LocalServer [string]   — nome do servidor local (preenchido em modo Local)
     #>
     [CmdletBinding()]
-    [OutputType([string[]])]
+    [OutputType([PSCustomObject])]
     param()
 
     Write-Host ''
@@ -210,6 +216,7 @@ function Show-ScopeMenu {
     Write-Host ''
     Write-Host "  Floresta      : $($Forest.Name)" -ForegroundColor White
     Write-Host "  Total dominios: $($Domains.Count)" -ForegroundColor White
+    Write-Host "  Servidor local: $($env:COMPUTERNAME)" -ForegroundColor White
     Write-Host ''
     Write-Host '  Selecione o escopo de analise:' -ForegroundColor Yellow
     Write-Host ''
@@ -219,27 +226,47 @@ function Show-ScopeMenu {
         Write-Host ('  [{0}]  {1}' -f ($i + 1), $Domains[$i]) -ForegroundColor White
     }
 
+    Write-Host ('  [L]  Servidor Atual  ({0})' -f $env:COMPUTERNAME) -ForegroundColor Cyan
+
     Write-Host ''
     Write-Host ('-' * 72) -ForegroundColor DarkGray
 
     # Loop até receber uma entrada válida
     while ($true) {
-        $Raw = Read-Host '  Digite o numero da opcao'
+        $Raw = Read-Host '  Digite o numero da opcao (ou L para servidor atual)'
+
+        # Opção: Servidor Local
+        if ($Raw -match '^[Ll]$') {
+            Write-Host "  >> Escopo: Servidor Atual ($($env:COMPUTERNAME))" -ForegroundColor Cyan
+            return [PSCustomObject]@{
+                Mode        = 'Local'
+                Domains     = @()
+                LocalServer = $env:COMPUTERNAME
+            }
+        }
 
         if ($Raw -match '^\d+$') {
             $N = [int]$Raw
 
             if ($N -eq 0) {
                 Write-Host "  >> Escopo: Toda a Floresta ($($Domains.Count) dominio(s))" -ForegroundColor Yellow
-                return $Domains
+                return [PSCustomObject]@{
+                    Mode        = 'Forest'
+                    Domains     = $Domains
+                    LocalServer = $null
+                }
             }
             elseif ($N -ge 1 -and $N -le $Domains.Count) {
                 Write-Host "  >> Escopo: Dominio '$($Domains[$N - 1])'" -ForegroundColor Yellow
-                return @($Domains[$N - 1])
+                return [PSCustomObject]@{
+                    Mode        = 'Domain'
+                    Domains     = @($Domains[$N - 1])
+                    LocalServer = $null
+                }
             }
         }
 
-        Write-Host "  Opcao invalida. Digite um numero entre 0 e $($Domains.Count)." -ForegroundColor Red
+        Write-Host "  Opcao invalida. Digite um numero entre 0 e $($Domains.Count), ou 'L' para servidor atual." -ForegroundColor Red
     }
 }
 
@@ -278,24 +305,41 @@ function Test-KerberosAuditPolicy {
 
     Write-Log "  Verificando politica de auditoria Kerberos em: $DCName" -Level INFO
 
+    # Detecta se o DC alvo é o servidor local — evita dependência de WinRM
+    $IsLocalDC = ($DCName -eq $env:COMPUTERNAME) -or
+                 ($DCName -ieq 'localhost') -or
+                 ($DCName -eq '127.0.0.1')
+
     try {
-        $AuditStatus = Invoke-Command -ComputerName $DCName -ErrorAction Stop -ScriptBlock {
-            param ([string]$GUIDAuth, [string]$GUIDTicket)
-
-            # Verifica se a subcategoria tem configuração de auditoria ativa.
-            # A presença de "Success" ou "Failure" na saída indica que está habilitada.
-            # O uso do GUID evita dependência de idioma (PT, EN, ES, etc.).
-            function Test-AuditSubcategory {
-                param ([string]$GUID)
-                $Out = & auditpol /get /subcategory:"$GUID" 2>&1
-                return ($Out -join ' ') -match '\b(Success|Failure)\b'
+        if ($IsLocalDC) {
+            # Execução local: auditpol roda diretamente no processo atual
+            Write-Log "  Modo local: executando auditpol localmente em '$DCName'" -Level INFO
+            $OutAuth   = & auditpol /get /subcategory:"$AuditGUID_KerbAuth"   2>&1
+            $OutTicket = & auditpol /get /subcategory:"$AuditGUID_KerbTicket" 2>&1
+            $AuditStatus = [PSCustomObject]@{
+                AuthEnabled   = (($OutAuth   -join ' ') -match '\b(Success|Failure)\b')
+                TicketEnabled = (($OutTicket -join ' ') -match '\b(Success|Failure)\b')
             }
+        }
+        else {
+            $AuditStatus = Invoke-Command -ComputerName $DCName -ErrorAction Stop -ScriptBlock {
+                param ([string]$GUIDAuth, [string]$GUIDTicket)
 
-            return [PSCustomObject]@{
-                AuthEnabled   = (Test-AuditSubcategory -GUID $GUIDAuth)
-                TicketEnabled = (Test-AuditSubcategory -GUID $GUIDTicket)
-            }
-        } -ArgumentList $AuditGUID_KerbAuth, $AuditGUID_KerbTicket
+                # Verifica se a subcategoria tem configuração de auditoria ativa.
+                # A presença de "Success" ou "Failure" na saída indica que está habilitada.
+                # O uso do GUID evita dependência de idioma (PT, EN, ES, etc.).
+                function Test-AuditSubcategory {
+                    param ([string]$GUID)
+                    $Out = & auditpol /get /subcategory:"$GUID" 2>&1
+                    return ($Out -join ' ') -match '\b(Success|Failure)\b'
+                }
+
+                return [PSCustomObject]@{
+                    AuthEnabled   = (Test-AuditSubcategory -GUID $GUIDAuth)
+                    TicketEnabled = (Test-AuditSubcategory -GUID $GUIDTicket)
+                }
+            } -ArgumentList $AuditGUID_KerbAuth, $AuditGUID_KerbTicket
+        }
 
         $BothOK = $AuditStatus.AuthEnabled -and $AuditStatus.TicketEnabled
 
@@ -422,9 +466,21 @@ function Get-WeakEncryptionEvents {
     [int]$TotalRaw  = 0
     [int]$WeakFound = 0
 
+    # Detecta se o DC alvo é o servidor local — evita dependência de WinRM
+    $IsLocalDC = ($DCName -eq $env:COMPUTERNAME) -or
+                 ($DCName -ieq 'localhost') -or
+                 ($DCName -eq '127.0.0.1')
+
     # ── Coleta os eventos brutos via Get-WinEvent ──────────────────────────────
     try {
-        $RawEvents = Get-WinEvent -ComputerName $DCName -FilterXml $XPath -ErrorAction Stop
+        if ($IsLocalDC) {
+            # Leitura direta do log local — sem tráfego de rede
+            Write-Log "  Modo local: lendo log de seguranca localmente em '$DCName'" -Level INFO
+            $RawEvents = Get-WinEvent -FilterXml $XPath -ErrorAction Stop
+        }
+        else {
+            $RawEvents = Get-WinEvent -ComputerName $DCName -FilterXml $XPath -ErrorAction Stop
+        }
         $TotalRaw  = $RawEvents.Count
         Write-Log "  $TotalRaw evento(s) bruto(s) obtido(s) de '$DCName'. Processando..." -Level INFO
     }
@@ -620,68 +676,113 @@ catch {
 }
 
 # ── Exibe menu e obtém o escopo selecionado pelo administrador ─────────────────
-$SelectedDomains = Show-ScopeMenu
+$Scope = Show-ScopeMenu
 
-Write-Log ''                                                                          -Level INFO
-Write-Log "Escopo      : $($SelectedDomains -join ' | ')"                            -Level INFO
+Write-Log '' -Level INFO
+Write-Log "Escopo      : $(if ($Scope.Mode -eq 'Local') { "Servidor Atual ($($Scope.LocalServer))" } else { $Scope.Domains -join ' | ' })" -Level INFO
 Write-Log "Cripto alvo : RC4-HMAC (0x17) | DES-CBC-CRC (0x01) | DES-CBC-MD5 (0x03)" -Level INFO
-Write-Log ''                                                                          -Level INFO
+Write-Log '' -Level INFO
 
 # ==============================================================================
 # SEÇÃO 10 — LOOP PRINCIPAL: DOMÍNIOS → DCs → AUDITORIA → EVENTOS
 # ==============================================================================
 
-foreach ($Domain in $SelectedDomains) {
+if ($Scope.Mode -eq 'Local') {
 
-    Write-Log ('=' * 72)         -Level SECTION
-    Write-Log "DOMINIO: $Domain" -Level SECTION
-    Write-Log ('=' * 72)         -Level SECTION
+    # ── Modo: Servidor Atual ───────────────────────────────────────────────────
+    $LocalServer = $Scope.LocalServer
 
-    # ── Obtém lista de Domain Controllers do domínio ──────────────────────────
+    # Obtém o domínio do servidor local para exibição nos alertas
     try {
-        [string[]]$DCs = Get-ADDomainController -Filter * -Server $Domain -ErrorAction Stop |
-                         Select-Object -ExpandProperty HostName |
-                         Sort-Object
-
-        Write-Log "Domain Controllers encontrados em '$Domain': $($DCs.Count)" -Level INFO
-        Write-Log "Lista: $($DCs -join ', ')" -Level INFO
+        $LocalDomain = (Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop).Domain
     }
     catch {
-        Write-Log "Erro ao listar DCs do dominio '$Domain': $_" -Level ERROR
-        continue   # Passa para o próximo domínio
+        $LocalDomain = $env:USERDNSDOMAIN
+        if (-not $LocalDomain) { $LocalDomain = 'Desconhecido' }
     }
 
-    # ── Processa cada Domain Controller ───────────────────────────────────────
-    foreach ($DC in $DCs) {
+    Write-Log ('=' * 72)                        -Level SECTION
+    Write-Log "SERVIDOR LOCAL : $LocalServer"   -Level SECTION
+    Write-Log "DOMINIO        : $LocalDomain"   -Level SECTION
+    Write-Log ('=' * 72)                        -Level SECTION
 
-        Write-Log ''            -Level INFO
-        Write-Log ('-' * 60)   -Level INFO
-        Write-Log "DC: $DC"    -Level INFO
-        Write-Log ('-' * 60)   -Level INFO
+    Write-Log ''                    -Level INFO
+    Write-Log ('-' * 60)            -Level INFO
+    Write-Log "DC: $LocalServer"    -Level INFO
+    Write-Log ('-' * 60)            -Level INFO
 
-        # ══════════════════════════════════════════════════════════════════════
-        # ETAPA A — Verificação da política de auditoria Kerberos
-        # ══════════════════════════════════════════════════════════════════════
-        $Audit = Test-KerberosAuditPolicy -DCName $DC
+    # ETAPA A — Verificação da política de auditoria Kerberos (local)
+    $Audit = Test-KerberosAuditPolicy -DCName $LocalServer
 
-        if (-not $Audit.BothEnabled) {
-            # Alerta, grava no TXT e passa para o próximo DC
-            Write-AuditAlert -DCName $DC -DomainName $Domain -AuditStatus $Audit
-            $DCsNoAudit.Add($DC)
-            continue
-        }
-
-        # ══════════════════════════════════════════════════════════════════════
-        # ETAPA B — Coleta de eventos 4768/4769 com criptografia fraca
-        # ══════════════════════════════════════════════════════════════════════
-        $Events = Get-WeakEncryptionEvents -DCName $DC -DaysBack $DaysBack
-
+    if (-not $Audit.BothEnabled) {
+        Write-AuditAlert -DCName $LocalServer -DomainName $LocalDomain -AuditStatus $Audit
+        $DCsNoAudit.Add($LocalServer)
+    }
+    else {
+        # ETAPA B — Coleta de eventos 4768/4769 com criptografia fraca (local)
+        $Events = Get-WeakEncryptionEvents -DCName $LocalServer -DaysBack $DaysBack
         foreach ($E in $Events) {
             $AllResults.Add($E)
         }
+    }
 
-    }   # fim foreach DC
-}       # fim foreach Domain
+}
+else {
+
+    # ── Modo: Floresta ou Domínio específico ──────────────────────────────────
+    foreach ($Domain in $Scope.Domains) {
+
+        Write-Log ('=' * 72)         -Level SECTION
+        Write-Log "DOMINIO: $Domain" -Level SECTION
+        Write-Log ('=' * 72)         -Level SECTION
+
+        # ── Obtém lista de Domain Controllers do domínio ──────────────────────
+        try {
+            [string[]]$DCs = Get-ADDomainController -Filter * -Server $Domain -ErrorAction Stop |
+                             Select-Object -ExpandProperty HostName |
+                             Sort-Object
+
+            Write-Log "Domain Controllers encontrados em '$Domain': $($DCs.Count)" -Level INFO
+            Write-Log "Lista: $($DCs -join ', ')" -Level INFO
+        }
+        catch {
+            Write-Log "Erro ao listar DCs do dominio '$Domain': $_" -Level ERROR
+            continue   # Passa para o próximo domínio
+        }
+
+        # ── Processa cada Domain Controller ───────────────────────────────────
+        foreach ($DC in $DCs) {
+
+            Write-Log ''            -Level INFO
+            Write-Log ('-' * 60)   -Level INFO
+            Write-Log "DC: $DC"    -Level INFO
+            Write-Log ('-' * 60)   -Level INFO
+
+            # ══════════════════════════════════════════════════════════════════
+            # ETAPA A — Verificação da política de auditoria Kerberos
+            # ══════════════════════════════════════════════════════════════════
+            $Audit = Test-KerberosAuditPolicy -DCName $DC
+
+            if (-not $Audit.BothEnabled) {
+                # Alerta, grava no TXT e passa para o próximo DC
+                Write-AuditAlert -DCName $DC -DomainName $Domain -AuditStatus $Audit
+                $DCsNoAudit.Add($DC)
+                continue
+            }
+
+            # ══════════════════════════════════════════════════════════════════
+            # ETAPA B — Coleta de eventos 4768/4769 com criptografia fraca
+            # ══════════════════════════════════════════════════════════════════
+            $Events = Get-WeakEncryptionEvents -DCName $DC -DaysBack $DaysBack
+
+            foreach ($E in $Events) {
+                $AllResults.Add($E)
+            }
+
+        }   # fim foreach DC
+    }       # fim foreach Domain
+
+}   # fim if/else escopo
 
 # ==============================================================================
 # SEÇÃO 11 — EXPORTAÇÃO DO CSV E RELATÓRIO FINAL
