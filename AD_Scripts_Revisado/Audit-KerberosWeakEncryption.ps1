@@ -3,42 +3,42 @@
     Audit-KerberosWeakEncryption.ps1
 
 .DESCRIPTION
-    Audita Domain Controllers para detectar uso de criptografia fraca (RC4/DES)
-    nos eventos Kerberos 4768 e 4769, identificando sistemas legados (ex.: Windows
-    Server 2003, aplicações antigas) antes do bloqueio definitivo do RC4 no ambiente
-    Active Directory.
+    Audits Domain Controllers to detect weak encryption (RC4/DES) usage
+    in Kerberos events 4768 and 4769, identifying legacy systems (e.g., Windows
+    Server 2003, older applications) before definitively blocking RC4 in the
+    Active Directory environment.
 
-    Fluxo de execução:
-      1. Menu de seleção do escopo: Floresta completa, domínio específico ou
-         apenas o servidor local (onde o script está sendo executado).
-         - Modo "Servidor Atual" [L]: auditpol e Get-WinEvent rodam localmente,
-           sem necessidade de WinRM ou acesso remoto.
-      2. Para cada DC selecionado, valida se a auditoria Kerberos está habilitada.
-         - Se NÃO estiver: alerta o administrador, grava o DC em TXT e passa ao próximo.
-      3. Para cada DC com auditoria ativa, coleta eventos 4768/4769 (últimos 30 dias)
-         filtrando por criptografia fraca via XPath (Get-WinEvent — alto desempenho).
-      4. Exporta resultados para CSV e gera relatório de análise.
-      5. Logs de execução em tempo real.
+    Execution flow:
+      1. Scope selection menu: Full forest, specific domain, or local server only
+         (where the script is being executed).
+         - "Current Server" mode [L]: auditpol and Get-WinEvent run locally,
+           with no WinRM or remote access required.
+      2. For each selected DC, validates whether Kerberos auditing is enabled.
+         - If NOT enabled: alerts the administrator, records the DC in a TXT file and moves on.
+      3. For each DC with active auditing, collects events 4768/4769 (last 30 days)
+         filtering for weak encryption via XPath (Get-WinEvent — high performance).
+      4. Exports results to CSV and generates an analysis report.
+      5. Real-time execution logs.
 
-    CRIPTOGRAFIAS FRACAS DETECTADAS:
-      0x17 → RC4-HMAC       (mais comum em ambientes legados)
+    WEAK ENCRYPTION TYPES DETECTED:
+      0x17 → RC4-HMAC       (most common in legacy environments)
       0x01 → DES-CBC-CRC
       0x03 → DES-CBC-MD5
 
-    EVENTOS MONITORADOS:
+    MONITORED EVENTS:
       4768 → Kerberos Authentication Service Request (TGT)
       4769 → Kerberos Service Ticket Request (TGS)
 
 .NOTES
-    Versão        : 1.1
-    Pré-requisitos: PowerShell 5.1+, módulo RSAT-ActiveDirectory,
-                    acesso remoto (RPC/DCOM) ao Event Log dos DCs,
-                    permissão de leitura do Security Event Log nos DCs.
+    Version       : 1.1
+    Prerequisites : PowerShell 5.1+, RSAT-ActiveDirectory module,
+                    remote access (RPC/DCOM) to DC Event Logs,
+                    read permission on the Security Event Log on DCs.
 
-    Saídas geradas:
-      LOG  → C:\Temp\Eventos\<ScriptName>_<DataHora>.log
-      CSV  → C:\Temp\Scripts\Eventos\<ScriptName>_<DataHora>.csv
-      TXT  → C:\Temp\Eventos\DCs_SemAuditoria_<DataHora>.txt  (se houver DCs sem auditoria)
+    Output files:
+      LOG  → C:\Temp\Eventos\<ScriptName>_<DateTime>.log
+      CSV  → C:\Temp\Scripts\Eventos\<ScriptName>_<DateTime>.csv
+      TXT  → C:\Temp\Eventos\DCs_SemAuditoria_<DateTime>.txt  (if any DCs lack auditing)
 #>
 
 #Requires -Version 5.1
@@ -47,40 +47,40 @@
 param()
 
 # ==============================================================================
-# SEÇÃO 1 — CONFIGURAÇÕES GLOBAIS E CONSTANTES
+# SECTION 1 — GLOBAL SETTINGS AND CONSTANTS
 # ==============================================================================
 
-# Nome do script sem extensão (usado para nomear arquivos de saída)
+# Script name without extension (used to name output files)
 $ScriptName = if ($MyInvocation.MyCommand.Name) {
     [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
 } else {
     'Audit-KerberosWeakEncryption'
 }
 
-# Timestamp da execução — formato seguro para nomes de arquivo
+# Execution timestamp — safe format for file names
 $RunTimestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
 
-# ─── Diretórios de saída ───────────────────────────────────────────────────────
+# ─── Output directories ────────────────────────────────────────────────────────
 $LogDir = 'C:\Temp\Eventos'
 $CSVDir = 'C:\Temp\Scripts\Eventos'
 
-# ─── Caminhos dos arquivos de saída ────────────────────────────────────────────
+# ─── Output file paths ─────────────────────────────────────────────────────────
 $LogFile      = Join-Path $LogDir "${ScriptName}_${RunTimestamp}.log"
 $CSVFile      = Join-Path $CSVDir "${ScriptName}_${RunTimestamp}.csv"
 $NoAuditTXT   = Join-Path $LogDir "DCs_SemAuditoria_${RunTimestamp}.txt"
 
-# ─── Período de análise retroativa (dias) ──────────────────────────────────────
+# ─── Lookback period in days ───────────────────────────────────────────────────
 $DaysBack = 30
 
-# ─── Tipos de criptografia fraca que serão filtrados (valores inteiros) ────────
-#     Qualquer evento com TicketEncryptionType nesses valores será capturado.
+# ─── Weak encryption types to filter (integer values) ─────────────────────────
+#     Any event with TicketEncryptionType matching these values will be captured.
 $WeakEncTypes = @(
-    0x17,   # RC4-HMAC       — vastamente usado por sistemas legados
-    0x01,   # DES-CBC-CRC    — obsoleto desde RFC 6649
-    0x03    # DES-CBC-MD5    — obsoleto desde RFC 6649
+    0x17,   # RC4-HMAC       — widely used by legacy systems
+    0x01,   # DES-CBC-CRC    — deprecated since RFC 6649
+    0x03    # DES-CBC-MD5    — deprecated since RFC 6649
 )
 
-# ─── Mapa de tipos de criptografia para exibição amigável ──────────────────────
+# ─── Encryption type map for friendly display ──────────────────────────────────
 $EncTypeMap = @{
     0x01 = 'DES-CBC-CRC'
     0x03 = 'DES-CBC-MD5'
@@ -91,27 +91,27 @@ $EncTypeMap = @{
     0xFF = 'RC4-MD4'
 }
 
-# ─── GUIDs das subcategorias de auditoria Kerberos ─────────────────────────────
-#     O uso de GUIDs garante funcionamento independente do idioma do SO.
-$AuditGUID_KerbAuth   = '{0CCE9242-69AE-11D9-BED3-505054503030}'   # → evento 4768
-$AuditGUID_KerbTicket = '{0CCE9240-69AE-11D9-BED3-505054503030}'   # → evento 4769
+# ─── Kerberos audit subcategory GUIDs ─────────────────────────────────────────
+#     Using GUIDs ensures language-independent operation (EN, PT, ES, etc.).
+$AuditGUID_KerbAuth   = '{0CCE9242-69AE-11D9-BED3-505054503030}'   # → event 4768
+$AuditGUID_KerbTicket = '{0CCE9240-69AE-11D9-BED3-505054503030}'   # → event 4769
 
-# ─── Coleções de resultados ────────────────────────────────────────────────────
-$AllResults   = [System.Collections.Generic.List[PSObject]]::new()   # eventos coletados
-$DCsNoAudit   = [System.Collections.Generic.List[string]]::new()     # DCs sem auditoria
+# ─── Result collections ────────────────────────────────────────────────────────
+$AllResults   = [System.Collections.Generic.List[PSObject]]::new()   # collected events
+$DCsNoAudit   = [System.Collections.Generic.List[string]]::new()     # DCs without auditing
 
 # ==============================================================================
-# SEÇÃO 2 — FUNÇÃO DE LOGGING EM TEMPO REAL
+# SECTION 2 — REAL-TIME LOGGING FUNCTION
 # ==============================================================================
 
 function Write-Log {
     <#
     .SYNOPSIS
-        Grava uma entrada de log no console e no arquivo de log em tempo real.
+        Writes a log entry to the console and log file in real time.
     .PARAMETER Message
-        Texto da mensagem a registrar.
+        Log message text.
     .PARAMETER Level
-        Nível de severidade: INFO | WARNING | ERROR | SUCCESS | SECTION
+        Severity level: INFO | WARNING | ERROR | SUCCESS | SECTION
     #>
     [CmdletBinding()]
     param (
@@ -127,7 +127,7 @@ function Write-Log {
     $Ts    = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $Entry = "[$Ts][$Level] $Message"
 
-    # Cor de exibição no console por nível de severidade
+    # Console color by severity level
     $Color = switch ($Level) {
         'INFO'    { 'Cyan'    }
         'WARNING' { 'Yellow'  }
@@ -139,24 +139,24 @@ function Write-Log {
 
     Write-Host $Entry -ForegroundColor $Color
 
-    # Grava imediatamente no arquivo (sem buffer) — log em tempo real
+    # Writes immediately to file (unbuffered) — real-time logging
     try {
         Add-Content -Path $LogFile -Value $Entry -Encoding UTF8 -ErrorAction Stop
     }
     catch {
-        # Falha no log não deve interromper a execução principal
+        # Log failure must not interrupt main execution
         Write-Host "  [AVISO-INTERNO] Falha ao gravar no log: $_" -ForegroundColor DarkYellow
     }
 }
 
 # ==============================================================================
-# SEÇÃO 3 — INICIALIZAÇÃO DE DIRETÓRIOS
+# SECTION 3 — DIRECTORY INITIALIZATION
 # ==============================================================================
 
 function Initialize-OutputDirectories {
     <#
     .SYNOPSIS
-        Cria os diretórios de saída caso não existam.
+        Creates output directories if they do not exist.
     #>
     [CmdletBinding()]
     param()
@@ -165,7 +165,7 @@ function Initialize-OutputDirectories {
         if (-not (Test-Path -LiteralPath $Dir -PathType Container)) {
             try {
                 New-Item -Path $Dir -ItemType Directory -Force | Out-Null
-                # Antes do arquivo de log existir, usa Write-Host diretamente
+                # Before the log file exists, use Write-Host directly
                 Write-Host "  [INFO] Diretorio criado: $Dir" -ForegroundColor Cyan
             }
             catch {
@@ -177,19 +177,19 @@ function Initialize-OutputDirectories {
 }
 
 # ==============================================================================
-# SEÇÃO 4 — MENU DE SELEÇÃO DO ESCOPO (FLORESTA / DOMÍNIO)
+# SECTION 4 — SCOPE SELECTION MENU (FOREST / DOMAIN / LOCAL SERVER)
 # ==============================================================================
 
 function Show-ScopeMenu {
     <#
     .SYNOPSIS
-        Exibe menu interativo para o administrador selecionar o escopo de análise:
-        toda a floresta AD, um domínio específico ou apenas o servidor local.
+        Displays an interactive menu for the administrator to select the analysis scope:
+        full AD forest, a specific domain, or the local server only.
     .OUTPUTS
-        [PSCustomObject] com:
+        [PSCustomObject] with:
           Mode        [string]   — 'Forest' | 'Domain' | 'Local'
-          Domains     [string[]] — domínios selecionados (vazio em modo Local)
-          LocalServer [string]   — nome do servidor local (preenchido em modo Local)
+          Domains     [string[]] — selected domains (empty in Local mode)
+          LocalServer [string]   — local server name (populated in Local mode)
     #>
     [CmdletBinding()]
     [OutputType([PSCustomObject])]
@@ -202,7 +202,7 @@ function Show-ScopeMenu {
     Write-Host ('=' * 72) -ForegroundColor Magenta
     Write-Host ''
 
-    # Obtém a topologia da floresta via .NET (não depende do módulo AD)
+    # Retrieves forest topology via .NET (does not depend on the AD module)
     Write-Host '  Obtendo topologia da floresta Active Directory...' -ForegroundColor DarkCyan
     try {
         $Forest  = [System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
@@ -231,11 +231,11 @@ function Show-ScopeMenu {
     Write-Host ''
     Write-Host ('-' * 72) -ForegroundColor DarkGray
 
-    # Loop até receber uma entrada válida
+    # Loop until a valid input is received
     while ($true) {
         $Raw = Read-Host '  Digite o numero da opcao (ou L para servidor atual)'
 
-        # Opção: Servidor Local
+        # Option: Local Server
         if ($Raw -match '^[Ll]$') {
             Write-Host "  >> Escopo: Servidor Atual ($($env:COMPUTERNAME))" -ForegroundColor Cyan
             return [PSCustomObject]@{
@@ -271,30 +271,33 @@ function Show-ScopeMenu {
 }
 
 # ==============================================================================
-# SEÇÃO 5 — VERIFICAÇÃO DA POLÍTICA DE AUDITORIA KERBEROS
+# SECTION 5 — KERBEROS AUDIT POLICY VERIFICATION
 # ==============================================================================
 
 function Test-KerberosAuditPolicy {
     <#
     .SYNOPSIS
-        Verifica remotamente se as subcategorias de auditoria Kerberos estão ativas
-        no Domain Controller informado.
+        Verifies whether the Kerberos audit subcategories are active on the given
+        Domain Controller.
 
     .DESCRIPTION
-        Conecta-se ao DC via Invoke-Command e executa auditpol usando os GUIDs das
-        subcategorias (independente de idioma do SO):
-          {0CCE9242...} → Kerberos Authentication Service   (evento 4768)
-          {0CCE9240...} → Kerberos Service Ticket Operations (evento 4769)
+        Connects to the DC via Invoke-Command and runs auditpol using subcategory GUIDs
+        (language-independent):
+          {0CCE9242...} → Kerberos Authentication Service   (event 4768)
+          {0CCE9240...} → Kerberos Service Ticket Operations (event 4769)
+
+        When the target DC is the local server, auditpol runs directly in the current
+        process without requiring WinRM.
 
     .PARAMETER DCName
-        FQDN ou nome NetBIOS do Domain Controller.
+        FQDN or NetBIOS name of the Domain Controller.
 
     .OUTPUTS
-        [PSCustomObject] com:
-          BothEnabled   [bool]   — ambas subcategorias ativas
+        [PSCustomObject] with:
+          BothEnabled   [bool]   — both subcategories active
           AuthEnabled   [bool]   — Kerberos Authentication Service (4768)
           TicketEnabled [bool]   — Kerberos Service Ticket Operations (4769)
-          ConnectError  [string] — mensagem de erro de conectividade (se houver)
+          ConnectError  [string] — connectivity error message (if any)
     #>
     [CmdletBinding()]
     [OutputType([PSCustomObject])]
@@ -305,14 +308,14 @@ function Test-KerberosAuditPolicy {
 
     Write-Log "  Verificando politica de auditoria Kerberos em: $DCName" -Level INFO
 
-    # Detecta se o DC alvo é o servidor local — evita dependência de WinRM
+    # Detects whether the target DC is the local server — avoids WinRM dependency
     $IsLocalDC = ($DCName -eq $env:COMPUTERNAME) -or
                  ($DCName -ieq 'localhost') -or
                  ($DCName -eq '127.0.0.1')
 
     try {
         if ($IsLocalDC) {
-            # Execução local: auditpol roda diretamente no processo atual
+            # Local execution: auditpol runs directly in the current process
             Write-Log "  Modo local: executando auditpol localmente em '$DCName'" -Level INFO
             $OutAuth   = & auditpol /get /subcategory:"$AuditGUID_KerbAuth"   2>&1
             $OutTicket = & auditpol /get /subcategory:"$AuditGUID_KerbTicket" 2>&1
@@ -325,9 +328,9 @@ function Test-KerberosAuditPolicy {
             $AuditStatus = Invoke-Command -ComputerName $DCName -ErrorAction Stop -ScriptBlock {
                 param ([string]$GUIDAuth, [string]$GUIDTicket)
 
-                # Verifica se a subcategoria tem configuração de auditoria ativa.
-                # A presença de "Success" ou "Failure" na saída indica que está habilitada.
-                # O uso do GUID evita dependência de idioma (PT, EN, ES, etc.).
+                # Checks whether the audit subcategory is active.
+                # The presence of "Success" or "Failure" in the output indicates it is enabled.
+                # Using the GUID avoids language dependency (EN, PT, ES, etc.).
                 function Test-AuditSubcategory {
                     param ([string]$GUID)
                     $Out = & auditpol /get /subcategory:"$GUID" 2>&1
@@ -370,14 +373,14 @@ function Test-KerberosAuditPolicy {
 }
 
 # ==============================================================================
-# SEÇÃO 6 — CONVERSÃO DO TIPO DE CRIPTOGRAFIA (STRING → INT)
+# SECTION 6 — ENCRYPTION TYPE CONVERSION (STRING → INT)
 # ==============================================================================
 
 function ConvertFrom-EncTypeString {
     <#
     .SYNOPSIS
-        Converte o valor do campo TicketEncryptionType (pode vir como "0x17" ou "23")
-        para um inteiro comparável. Retorna $null se o valor for inválido.
+        Converts the TicketEncryptionType field value (may arrive as "0x17" or "23")
+        to a comparable integer. Returns $null if the value is invalid.
     #>
     [CmdletBinding()]
     param (
@@ -390,11 +393,11 @@ function ConvertFrom-EncTypeString {
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
 
     try {
-        # Formato hexadecimal com prefixo "0x" (ex.: "0x17", "0x01")
+        # Hexadecimal format with "0x" prefix (e.g., "0x17", "0x01")
         if ($Value -match '^0[xX]([0-9A-Fa-f]+)$') {
             return [Convert]::ToInt32($Matches[1], 16)
         }
-        # Formato decimal (ex.: "23", "1", "3")
+        # Decimal format (e.g., "23", "1", "3")
         elseif ($Value -match '^-?\d+$') {
             return [int]$Value
         }
@@ -406,30 +409,32 @@ function ConvertFrom-EncTypeString {
 }
 
 # ==============================================================================
-# SEÇÃO 7 — COLETA E FILTRAGEM DE EVENTOS KERBEROS (4768 / 4769)
+# SECTION 7 — KERBEROS EVENT COLLECTION AND FILTERING (4768 / 4769)
 # ==============================================================================
 
 function Get-WeakEncryptionEvents {
     <#
     .SYNOPSIS
-        Coleta eventos 4768 e 4769 do log de Segurança de um Domain Controller
-        e retorna apenas os que utilizam criptografia fraca (RC4, DES).
+        Collects events 4768 and 4769 from a Domain Controller's Security log
+        and returns only those using weak encryption (RC4, DES).
 
     .DESCRIPTION
-        Utiliza Get-WinEvent com filtro XPath para máximo desempenho:
-          - O filtro é avaliado no servidor remoto, reduzindo tráfego de rede.
-          - Apenas os eventos relevantes (4768/4769 no período) trafegam pela rede.
-          - A filtragem por tipo de criptografia fraca é feita localmente após o parse
-            do XML de cada evento.
+        Uses Get-WinEvent with an XPath filter for maximum performance:
+          - The filter is evaluated on the remote server, reducing network traffic.
+          - Only relevant events (4768/4769 in the time window) travel over the network.
+          - Weak encryption type filtering is performed locally after parsing each event's XML.
+
+        When the target DC is the local server, the Security log is read directly
+        without requiring WinRM.
 
     .PARAMETER DCName
-        Nome do Domain Controller.
+        Domain Controller name.
 
     .PARAMETER DaysBack
-        Janela de tempo retroativa em dias (padrão: 30).
+        Lookback time window in days (default: 30).
 
     .OUTPUTS
-        [PSObject[]] Lista de eventos filtrados com todos os campos relevantes.
+        [PSObject[]] Filtered event list with all relevant fields.
     #>
     [CmdletBinding()]
     param (
@@ -443,12 +448,12 @@ function Get-WeakEncryptionEvents {
 
     Write-Log "  Coletando eventos 4768/4769 de '$DCName' (ultimos $DaysBack dias)..." -Level INFO
 
-    # Converte a data de início para formato UTC ISO 8601 exigido pelo XPath do Event Log
+    # Converts start date to UTC ISO 8601 format required by the Event Log XPath filter
     $StartUTC = (Get-Date).AddDays(-$DaysBack).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.000Z')
 
-    # ── Filtro XPath otimizado ─────────────────────────────────────────────────
-    # Filtra no servidor: apenas EventIDs 4768/4769 no período → tráfego mínimo.
-    # O operador &gt;= é a codificação XML de >=.
+    # ── Optimized XPath filter ─────────────────────────────────────────────────
+    # Server-side filter: only EventIDs 4768/4769 in the time window → minimal traffic.
+    # The &gt;= operator is the XML encoding of >=.
     $XPath = @"
 <QueryList>
   <Query Id="0" Path="Security">
@@ -466,15 +471,15 @@ function Get-WeakEncryptionEvents {
     [int]$TotalRaw  = 0
     [int]$WeakFound = 0
 
-    # Detecta se o DC alvo é o servidor local — evita dependência de WinRM
+    # Detects whether the target DC is the local server — avoids WinRM dependency
     $IsLocalDC = ($DCName -eq $env:COMPUTERNAME) -or
                  ($DCName -ieq 'localhost') -or
                  ($DCName -eq '127.0.0.1')
 
-    # ── Coleta os eventos brutos via Get-WinEvent ──────────────────────────────
+    # ── Collect raw events via Get-WinEvent ────────────────────────────────────
     try {
         if ($IsLocalDC) {
-            # Leitura direta do log local — sem tráfego de rede
+            # Direct read from the local log — no network traffic
             Write-Log "  Modo local: lendo log de seguranca localmente em '$DCName'" -Level INFO
             $RawEvents = Get-WinEvent -FilterXml $XPath -ErrorAction Stop
         }
@@ -485,7 +490,7 @@ function Get-WeakEncryptionEvents {
         Write-Log "  $TotalRaw evento(s) bruto(s) obtido(s) de '$DCName'. Processando..." -Level INFO
     }
     catch {
-        # Ausência de eventos no período é um cenário normal, não um erro
+        # No events in the time window is a normal scenario, not an error
         if ($_.Exception.Message -match 'No events were found|nenhum evento') {
             Write-Log "  Nenhum evento 4768/4769 em '$DCName' no periodo de $DaysBack dias." -Level INFO
             return $LocalList
@@ -494,31 +499,31 @@ function Get-WeakEncryptionEvents {
         return $LocalList
     }
 
-    # ── Processa cada evento: parse do XML + filtragem por criptografia fraca ──
+    # ── Process each event: XML parse + weak encryption filtering ──────────────
     foreach ($Evt in $RawEvents) {
         try {
-            # Parse do XML do evento para acesso granular aos campos EventData
+            # Parse event XML for granular access to EventData fields
             [xml]$EvtXml = $Evt.ToXml()
 
-            # Constrói hashtable { NomeDoCampo → Valor } a partir dos nós Data
+            # Build hashtable { FieldName → Value } from Data nodes
             $D = @{}
             foreach ($Node in $EvtXml.Event.EventData.Data) {
                 $D[$Node.Name] = $Node.'#text'
             }
 
-            # ── Extrai e converte o tipo de criptografia ──────────────────────
+            # ── Extract and convert the encryption type ────────────────────────
             $EncRaw = if ($D.ContainsKey('TicketEncryptionType')) { $D['TicketEncryptionType'] } else { $null }
             $EncInt = ConvertFrom-EncTypeString -Value $EncRaw
 
-            # Descarta eventos sem tipo de criptografia (ex.: pré-autenticação falhou)
+            # Discard events without an encryption type (e.g., pre-authentication failed)
             if ($null -eq $EncInt) { continue }
 
-            # ── Filtra apenas tipos de criptografia FRACA ─────────────────────
+            # ── Filter only WEAK encryption types ──────────────────────────────
             if ($EncInt -notin $WeakEncTypes) { continue }
 
             $WeakFound++
 
-            # Nome amigável do tipo de criptografia para exibição/exportação
+            # Friendly encryption type name for display/export
             $EncName = if ($EncTypeMap.ContainsKey($EncInt)) {
                 '{0} (0x{1:X2})' -f $EncTypeMap[$EncInt], $EncInt
             }
@@ -526,48 +531,48 @@ function Get-WeakEncryptionEvents {
                 '0x{0:X2} (tipo desconhecido)' -f $EncInt
             }
 
-            # Remove prefixo de IPv4 mapeado em IPv6 (::ffff:192.168.x.x → 192.168.x.x)
+            # Strip IPv4-mapped IPv6 prefix (::ffff:192.168.x.x → 192.168.x.x)
             $IP = ([string]($D['IpAddress'])) -replace '^::ffff:', '' -replace '^\s+|\s+$', ''
 
-            # ── Monta o objeto de resultado estruturado ───────────────────────
-            # [ordered] garante a ordem dos campos no CSV exportado
+            # ── Build the structured result object ─────────────────────────────
+            # [ordered] ensures field order in the exported CSV
             $Obj = [PSCustomObject][ordered]@{
                 Timestamp                = $Evt.TimeCreated
                 EventID                  = $Evt.Id
 
-                # Conta que solicitou o ticket
+                # Account that requested the ticket
                 AccountName              = [string]($D['TargetUserName'])
                 AccountDomain            = [string]($D['TargetDomainName'])
 
-                # Origem da solicitação (identificação do sistema legado)
+                # Request origin (legacy system identification)
                 ClientAddress            = $IP
                 ClientPort               = [string]($D['IpPort'])
 
-                # ServiceName: relevante apenas em 4769 (TGS). Em 4768 (TGT) é N/A.
+                # ServiceName: relevant only for 4769 (TGS). For 4768 (TGT) it is N/A.
                 ServiceName              = if ($Evt.Id -eq 4769) {
                                                [string]($D['ServiceName'])
                                            } else {
                                                'N/A (TGT - evento 4768)'
                                            }
 
-                # ─── CAMPO PRINCIPAL: tipo de criptografia fraca detectado ────
+                # ─── MAIN FIELD: weak encryption type detected ─────────────────
                 TicketEncryptionType     = $EncName
                 EncryptionHex            = '0x{0:X2}' -f $EncInt
 
-                # Status do evento (0x0 = sucesso, outros = erros Kerberos)
+                # Event status (0x0 = success, others = Kerberos errors)
                 Status                   = [string]($D['Status'])
 
-                # Flag de destaque para identificação rápida de criptografia fraca
+                # Flag for quick identification of weak encryption
                 WeakEncryption           = $true
 
-                # DC de origem — essencial para localizar onde os eventos ocorrem
+                # Source DC — essential for locating where events originate
                 DomainController         = $DCName
             }
 
             $LocalList.Add($Obj)
         }
         catch {
-            # Falha em um evento individual não interrompe a coleta dos demais
+            # A failure on a single event does not interrupt collection of the remaining ones
             Write-Log "  [AVISO] Erro ao processar evento RecordId=$($Evt.RecordId): $_" -Level WARNING
             continue
         }
@@ -580,14 +585,14 @@ function Get-WeakEncryptionEvents {
 }
 
 # ==============================================================================
-# SEÇÃO 8 — FUNÇÃO DE ALERTA: DC SEM AUDITORIA
+# SECTION 8 — ALERT FUNCTION: DC WITHOUT AUDITING
 # ==============================================================================
 
 function Write-AuditAlert {
     <#
     .SYNOPSIS
-        Exibe alerta visual destacado no console, grava no log e no arquivo TXT
-        quando um DC não possui auditoria Kerberos habilitada.
+        Displays a highlighted visual alert on the console, writes to the log and TXT file
+        when a DC does not have Kerberos auditing enabled.
     #>
     [CmdletBinding()]
     param (
@@ -624,10 +629,10 @@ function Write-AuditAlert {
     Write-Host $Border -ForegroundColor Red
     Write-Host ''
 
-    # Registra no log de execução
+    # Write to the execution log
     Write-Log "ALERTA: DC '$DCName' (dominio '$DomainName') sem auditoria Kerberos completa. Passando ao proximo DC." -Level WARNING
 
-    # Grava linha estruturada no arquivo TXT de DCs sem auditoria
+    # Write structured line to the no-auditing DCs TXT file
     $TxtLine = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Dominio: $DomainName | DC: $DCName"
     if (-not $AuditStatus.AuthEnabled)   { $TxtLine += ' | SEM: Kerberos Authentication Service (4768)' }
     if (-not $AuditStatus.TicketEnabled) { $TxtLine += ' | SEM: Kerberos Service Ticket Operations (4769)' }
@@ -643,13 +648,13 @@ function Write-AuditAlert {
 }
 
 # ==============================================================================
-# SEÇÃO 9 — PONTO DE ENTRADA PRINCIPAL
+# SECTION 9 — MAIN ENTRY POINT
 # ==============================================================================
 
-# Cria diretórios antes de qualquer log (Write-Host é usado internamente)
+# Create directories before any logging (Write-Host is used internally)
 Initialize-OutputDirectories
 
-# ── Cabeçalho do log ──────────────────────────────────────────────────────────
+# ── Log header ─────────────────────────────────────────────────────────────────
 Write-Log ('=' * 72)                                              -Level SECTION
 Write-Log "SCRIPT   : $ScriptName"                               -Level SECTION
 Write-Log "INICIO   : $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')" -Level SECTION
@@ -659,7 +664,7 @@ Write-Log "PERIODO  : Ultimos $DaysBack dias"                     -Level SECTION
 Write-Log ('=' * 72)                                              -Level SECTION
 Write-Log ''                                                      -Level INFO
 
-# ── Verifica e importa o módulo Active Directory ──────────────────────────────
+# ── Check and import the Active Directory module ───────────────────────────────
 if (-not (Get-Module -Name ActiveDirectory -ListAvailable -ErrorAction SilentlyContinue)) {
     Write-Log 'Modulo ActiveDirectory (RSAT) nao encontrado.' -Level ERROR
     Write-Log 'Para instalar: Add-WindowsCapability -Online -Name "Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0"' -Level INFO
@@ -675,7 +680,7 @@ catch {
     exit 1
 }
 
-# ── Exibe menu e obtém o escopo selecionado pelo administrador ─────────────────
+# ── Display menu and retrieve the scope selected by the administrator ──────────
 $Scope = Show-ScopeMenu
 
 Write-Log '' -Level INFO
@@ -684,15 +689,15 @@ Write-Log "Cripto alvo : RC4-HMAC (0x17) | DES-CBC-CRC (0x01) | DES-CBC-MD5 (0x0
 Write-Log '' -Level INFO
 
 # ==============================================================================
-# SEÇÃO 10 — LOOP PRINCIPAL: DOMÍNIOS → DCs → AUDITORIA → EVENTOS
+# SECTION 10 — MAIN LOOP: DOMAINS → DCs → AUDITING → EVENTS
 # ==============================================================================
 
 if ($Scope.Mode -eq 'Local') {
 
-    # ── Modo: Servidor Atual ───────────────────────────────────────────────────
+    # ── Mode: Current Server ───────────────────────────────────────────────────
     $LocalServer = $Scope.LocalServer
 
-    # Obtém o domínio do servidor local para exibição nos alertas
+    # Retrieves the local server's domain for alert display
     try {
         $LocalDomain = (Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop).Domain
     }
@@ -711,7 +716,7 @@ if ($Scope.Mode -eq 'Local') {
     Write-Log "DC: $LocalServer"    -Level INFO
     Write-Log ('-' * 60)            -Level INFO
 
-    # ETAPA A — Verificação da política de auditoria Kerberos (local)
+    # STEP A — Kerberos audit policy verification (local)
     $Audit = Test-KerberosAuditPolicy -DCName $LocalServer
 
     if (-not $Audit.BothEnabled) {
@@ -719,7 +724,7 @@ if ($Scope.Mode -eq 'Local') {
         $DCsNoAudit.Add($LocalServer)
     }
     else {
-        # ETAPA B — Coleta de eventos 4768/4769 com criptografia fraca (local)
+        # STEP B — Collect events 4768/4769 with weak encryption (local)
         $Events = Get-WeakEncryptionEvents -DCName $LocalServer -DaysBack $DaysBack
         foreach ($E in $Events) {
             $AllResults.Add($E)
@@ -729,14 +734,14 @@ if ($Scope.Mode -eq 'Local') {
 }
 else {
 
-    # ── Modo: Floresta ou Domínio específico ──────────────────────────────────
+    # ── Mode: Forest or Specific Domain ───────────────────────────────────────
     foreach ($Domain in $Scope.Domains) {
 
         Write-Log ('=' * 72)         -Level SECTION
         Write-Log "DOMINIO: $Domain" -Level SECTION
         Write-Log ('=' * 72)         -Level SECTION
 
-        # ── Obtém lista de Domain Controllers do domínio ──────────────────────
+        # ── Retrieve list of Domain Controllers for the domain ─────────────────
         try {
             [string[]]$DCs = Get-ADDomainController -Filter * -Server $Domain -ErrorAction Stop |
                              Select-Object -ExpandProperty HostName |
@@ -747,10 +752,10 @@ else {
         }
         catch {
             Write-Log "Erro ao listar DCs do dominio '$Domain': $_" -Level ERROR
-            continue   # Passa para o próximo domínio
+            continue   # Move to the next domain
         }
 
-        # ── Processa cada Domain Controller ───────────────────────────────────
+        # ── Process each Domain Controller ─────────────────────────────────────
         foreach ($DC in $DCs) {
 
             Write-Log ''            -Level INFO
@@ -759,19 +764,19 @@ else {
             Write-Log ('-' * 60)   -Level INFO
 
             # ══════════════════════════════════════════════════════════════════
-            # ETAPA A — Verificação da política de auditoria Kerberos
+            # STEP A — Kerberos audit policy verification
             # ══════════════════════════════════════════════════════════════════
             $Audit = Test-KerberosAuditPolicy -DCName $DC
 
             if (-not $Audit.BothEnabled) {
-                # Alerta, grava no TXT e passa para o próximo DC
+                # Alert, write to TXT and move to the next DC
                 Write-AuditAlert -DCName $DC -DomainName $Domain -AuditStatus $Audit
                 $DCsNoAudit.Add($DC)
                 continue
             }
 
             # ══════════════════════════════════════════════════════════════════
-            # ETAPA B — Coleta de eventos 4768/4769 com criptografia fraca
+            # STEP B — Collect events 4768/4769 with weak encryption
             # ══════════════════════════════════════════════════════════════════
             $Events = Get-WeakEncryptionEvents -DCName $DC -DaysBack $DaysBack
 
@@ -779,13 +784,13 @@ else {
                 $AllResults.Add($E)
             }
 
-        }   # fim foreach DC
-    }       # fim foreach Domain
+        }   # end foreach DC
+    }       # end foreach Domain
 
-}   # fim if/else escopo
+}   # end if/else scope
 
 # ==============================================================================
-# SEÇÃO 11 — EXPORTAÇÃO DO CSV E RELATÓRIO FINAL
+# SECTION 11 — CSV EXPORT AND FINAL REPORT
 # ==============================================================================
 
 Write-Log ''                    -Level INFO
@@ -797,7 +802,7 @@ if ($AllResults.Count -gt 0) {
 
     Write-Log "Total de eventos com CRIPTOGRAFIA FRACA detectados: $($AllResults.Count)" -Level WARNING
 
-    # ── Exporta CSV ────────────────────────────────────────────────────────────
+    # ── Export CSV ─────────────────────────────────────────────────────────────
     try {
         $AllResults | Export-Csv -Path $CSVFile `
                                  -NoTypeInformation `
@@ -810,7 +815,7 @@ if ($AllResults.Count -gt 0) {
         Write-Log "Erro ao exportar CSV: $_" -Level ERROR
     }
 
-    # ── Resumo por tipo de criptografia ───────────────────────────────────────
+    # ── Summary by encryption type ─────────────────────────────────────────────
     Write-Log ''  -Level INFO
     Write-Log '[ RESUMO POR TIPO DE CRIPTOGRAFIA FRACA ]' -Level SECTION
     $AllResults |
@@ -826,7 +831,7 @@ if ($AllResults.Count -gt 0) {
             Write-Log ('  {0,-50} : {1,6} evento(s)' -f $DisplayName, $_.Count) -Level WARNING
         }
 
-    # ── Resumo por Domain Controller ──────────────────────────────────────────
+    # ── Summary by Domain Controller ───────────────────────────────────────────
     Write-Log ''  -Level INFO
     Write-Log '[ RESUMO POR DOMAIN CONTROLLER ]' -Level SECTION
     $AllResults |
@@ -836,7 +841,7 @@ if ($AllResults.Count -gt 0) {
             Write-Log ('  {0,-55} : {1,6} evento(s)' -f $_.Name, $_.Count) -Level INFO
         }
 
-    # ── Top 10 contas com mais eventos de criptografia fraca ──────────────────
+    # ── Top 10 accounts with most weak encryption events ───────────────────────
     Write-Log ''  -Level INFO
     Write-Log '[ TOP 10 CONTAS — MAIOR VOLUME DE CRIPTO FRACA ]' -Level SECTION
     $AllResults |
@@ -847,7 +852,7 @@ if ($AllResults.Count -gt 0) {
             Write-Log ('  {0,-55} : {1,6} evento(s)' -f $_.Name, $_.Count) -Level WARNING
         }
 
-    # ── Top 10 IPs de origem (prováveis sistemas legados) ─────────────────────
+    # ── Top 10 source IPs (probable legacy systems) ────────────────────────────
     Write-Log ''  -Level INFO
     Write-Log '[ TOP 10 IPs DE ORIGEM — PROVAVEIS SISTEMAS LEGADOS ]' -Level SECTION
     Write-Log '  (Enderecos que mais solicitaram tickets com criptografia fraca)' -Level INFO
@@ -860,7 +865,7 @@ if ($AllResults.Count -gt 0) {
             Write-Log ('  {0,-45} : {1,6} evento(s)  <- INVESTIGAR' -f $_.Name, $_.Count) -Level WARNING
         }
 
-    # ── Prévia no console (primeiros 50 registros) ────────────────────────────
+    # ── Console preview (first 50 records) ────────────────────────────────────
     Write-Host ''
     Write-Host ('PREVIEW — Primeiros 50 eventos com criptografia fraca detectada:') -ForegroundColor Red
     Write-Host ('  [!] Verifique o CSV para a lista completa: ' + $CSVFile) -ForegroundColor DarkRed
@@ -874,7 +879,7 @@ else {
     Write-Log 'O ambiente parece estar configurado corretamente para uso exclusivo de AES.' -Level SUCCESS
 }
 
-# ── Alerta consolidado: DCs sem auditoria ─────────────────────────────────────
+# ── Consolidated alert: DCs without auditing ──────────────────────────────────
 if ($DCsNoAudit.Count -gt 0) {
     Write-Log ''  -Level INFO
     Write-Log ('!' * 72) -Level WARNING
@@ -898,7 +903,7 @@ if ($DCsNoAudit.Count -gt 0) {
     Write-Log '      - Audit Kerberos Service Ticket Operations : Success e Failure' -Level INFO
 }
 
-# ── Rodapé final ──────────────────────────────────────────────────────────────
+# ── Final footer ───────────────────────────────────────────────────────────────
 Write-Log ''                                                              -Level INFO
 Write-Log ('=' * 72)                                                      -Level SECTION
 Write-Log 'EXECUCAO CONCLUIDA'                                            -Level SECTION
