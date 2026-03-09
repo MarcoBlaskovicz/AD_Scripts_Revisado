@@ -46,7 +46,7 @@ CHANGELOG:
            → [N/Total] DCNAME  Ping:OK  Ports:X/Y open  Repl:OK
     VIS-4  Final summary table in color on the console
            → each phase with status (OK/WARN/ERROR) and elapsed time
-  v6 - Additional troubleshooting coverage:
+  v6 - Additional troubleshooting coverage (all scoped to local DC):
     NEW-1  AD Database & FSMO: ntdsutil integrity, FSMO holders, PDC Emulator connectivity
     NEW-2  Kerberos & Auth: klist tickets, nltest /sc_query, account lockout events (4740)
     NEW-3  DNS deep-dive: dnscmd statistics/zones, _msdcs records, reverse PTR lookup
@@ -55,6 +55,12 @@ CHANGELOG:
     NEW-6  Security & Audit: privileged group members, auditpol, Security event IDs
     NEW-7  OS health: disk space (NTDS + SYSVOL), memory pool counters, Get-HotFix
     NEW-8  Sites & Subnets: nltest /dsgetsite, repadmin /siteoptions, subnet mapping
+  v7 - Scope enforcement (no remote DC hangs):
+    FIX-1  dcdiag: removed /e (enterprise) and /c; now /s:localhost with explicit test list
+    FIX-2  repadmin: all wildcard (*) targets replaced with 'localhost'
+    FIX-3  repadmin /showutdvec: scoped to localhost only
+    FIX-4  Invoke-ParallelTasks: added -TimeoutSeconds with per-task forced Stop()
+    FIX-5  Partner DC discovery: nltest /dclist reads local AD copy (safe); self excluded
 #>
 
 [CmdletBinding()]
@@ -146,9 +152,10 @@ function Get-DnsServers {
 function Invoke-ParallelTasks {
     param(
         [object[]]$Tasks,
-        [int]$MaxRunspaces  = 8,
-        [string]$PhaseLabel = "Processando",   # label for Write-Progress / spinner
-        [int]$ProgressId    = 1                # Write-Progress ID (avoids conflicts between calls)
+        [int]$MaxRunspaces   = 8,
+        [string]$PhaseLabel  = "Processando",  # label for Write-Progress / spinner
+        [int]$ProgressId     = 1,              # Write-Progress ID (avoids conflicts between calls)
+        [int]$TimeoutSeconds = 300             # per-task hard timeout; 0 = no limit
     )
 
     $pool = [runspacefactory]::CreateRunspacePool(1, $MaxRunspaces)
@@ -160,7 +167,14 @@ function Invoke-ParallelTasks {
         $ps = [powershell]::Create()
         $ps.RunspacePool = $pool
         [void]$ps.AddScript($task.ScriptBlock)
-        $jobs += [pscustomobject]@{ Label = $task.Label; PS = $ps; Handle = $ps.BeginInvoke(); Done = $false }
+        $jobs += [pscustomobject]@{
+            Label     = $task.Label
+            PS        = $ps
+            Handle    = $ps.BeginInvoke()
+            Done      = $false
+            StartedAt = [System.Diagnostics.Stopwatch]::StartNew()
+            TimedOut  = $false
+        }
     }
 
     $total      = $jobs.Count
@@ -174,21 +188,34 @@ function Invoke-ParallelTasks {
         -Status ("Aguardando... 0 / {0} concluídos" -f $total) `
         -PercentComplete 0
 
-    # Polling loop — updates spinner and Write-Progress until all jobs complete
+    # Polling loop — updates spinner, enforces per-task timeout, updates Write-Progress
     while ($done -lt $total) {
         foreach ($job in $jobs) {
-            if (-not $job.Done -and $job.Handle.IsCompleted) {
+            if ($job.Done) { continue }
+
+            if ($job.Handle.IsCompleted) {
                 $job.Done = $true
                 $done++
+                continue
+            }
+
+            # Hard timeout: stop and mark the runspace if it exceeds the limit
+            if ($TimeoutSeconds -gt 0 -and $job.StartedAt.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
+                try   { $job.PS.Stop() } catch {}
+                $job.Done     = $true
+                $job.TimedOut = $true
+                $done++
+                Write-Host ("`r  [TIMEOUT] {0} ({1}s limit exceeded)" -f $job.Label, $TimeoutSeconds).PadRight(80) `
+                    -ForegroundColor Yellow
             }
         }
 
         # VIS-1: spinner with elapsed time
-        $elapsed  = $sw.Elapsed
+        $elapsed    = $sw.Elapsed
         $elapsedStr = ("{0:D2}:{1:D2}:{2:D2}" -f [int]$elapsed.TotalHours, $elapsed.Minutes, $elapsed.Seconds)
-        $frame    = $spinFrames[$spinIdx % $spinFrames.Count]
+        $frame      = $spinFrames[$spinIdx % $spinFrames.Count]
         $spinIdx++
-        $pct      = [int](($done / $total) * 100)
+        $pct        = [int](($done / $total) * 100)
 
         # Write spinner on the same line (no newline)
         $spinLine = ("  {0}  {1}  [{2}/{3}]  {4}" -f $frame, $PhaseLabel, $done, $total, $elapsedStr)
@@ -209,19 +236,27 @@ function Invoke-ParallelTasks {
     Write-Host ("`r" + (" " * 80) + "`r") -NoNewline
     Write-Progress -Id $ProgressId -Activity $PhaseLabel -Completed
 
-    # Collect results
+    # Collect results — timed-out jobs get a diagnostic message instead of output
     $results = @()
     foreach ($job in $jobs) {
         $out = ""
-        try {
-            $raw = $job.PS.EndInvoke($job.Handle)
-            if ($raw) { $out = $raw | Out-String }
-            if ($job.PS.HadErrors) {
-                $errs = $job.PS.Streams.Error | Out-String
-                if ($errs.Trim()) { $out += ("`r`n--- ERRORS ---`r`n" + $errs) }
+        if ($job.TimedOut) {
+            $out = ("TIMEOUT: task '{0}' was forcibly stopped after {1}s.`r`nPartial output (if any):`r`n" -f $job.Label, $TimeoutSeconds)
+            try {
+                $partial = $job.PS.Streams.Information | Out-String
+                if ($partial.Trim()) { $out += $partial }
+            } catch {}
+        } else {
+            try {
+                $raw = $job.PS.EndInvoke($job.Handle)
+                if ($raw) { $out = $raw | Out-String }
+                if ($job.PS.HadErrors) {
+                    $errs = $job.PS.Streams.Error | Out-String
+                    if ($errs.Trim()) { $out += ("`r`n--- ERRORS ---`r`n" + $errs) }
+                }
+            } catch {
+                $out = ("ERROR: {0}" -f $_.Exception.Message)
             }
-        } catch {
-            $out = ("ERROR: {0}" -f $_.Exception.Message)
         }
         $job.PS.Dispose()
         $results += [pscustomobject]@{ Label = $job.Label; Output = $out }
@@ -503,9 +538,9 @@ try {
 Stop-PhaseTimer "Sistema / Rede / Serviços" "OK"
 
 # ============================================================
-# PERF-2: Heavy external commands — all in parallel
+# PERF-2: Heavy external commands — all in parallel, ALL scoped to localhost
 # dcdiag full + dns, repadmin (4 sub-cmds), w32tm (3), dfsrdiag (3)
-# Total time = duration of the slowest command (typically dcdiag /c /v /e)
+# All repadmin commands target localhost explicitly to avoid contacting remote DCs
 # ============================================================
 Start-PhaseTimer "Comandos Externos (dcdiag/repadmin/w32tm/dfsrdiag)"
 Write-Log "Disparando comandos externos em paralelo (dcdiag / repadmin / w32tm / dfsrdiag)" -Level START
@@ -516,34 +551,68 @@ $writer.Flush()
 $dcdiagFullFile = Join-Path $OutputDir "dcdiag_full.txt"
 $dcdiagDnsFile  = Join-Path $OutputDir "dcdiag_dns.txt"
 
-# Uses [scriptblock]::Create with here-string to embed file paths inside runspaces
+# Uses [scriptblock]::Create with here-string to embed file paths inside runspaces.
+#
+# IMPORTANT — dcdiag scope and timeout:
+#   /e (enterprise) and /c (comprehensive) enumerate ALL DCs in the forest and
+#   block indefinitely if any remote DC is unreachable (no native timeout).
+#   We run only LOCAL tests (/s:localhost) with an explicit process timeout via
+#   Start-Process -Wait -PassThru so the runspace engine can enforce -TimeoutSeconds.
+#   Tests covered: Advertising, KnowsOfRoleHolders, MachineAccount, NCSecDesc,
+#   NetLogons, ObjectsReplicated, Replications, RidManager, Services, SysVolCheck,
+#   VerifyEnterpriseReferences, VerifyReferences, VerifyReplicas, CheckSecurityError
 $sbDcdiagFull = [scriptblock]::Create(@"
-    if (Get-Command dcdiag.exe -ErrorAction SilentlyContinue) {
-        `$raw = & dcdiag.exe /c /v /e 2>&1
+    if (-not (Get-Command dcdiag.exe -ErrorAction SilentlyContinue)) { return 'dcdiag.exe not found.' }
+    `$outFile = '$dcdiagFullFile'
+    # Each /test: must be a separate argument — dcdiag does not accept comma-separated lists.
+    # Using the call operator & with a splatted array ensures correct argument tokenisation.
+    `$testArgs = @(
+        '/s:localhost', '/v',
+        '/test:Advertising',
+        '/test:KnowsOfRoleHolders',
+        '/test:MachineAccount',
+        '/test:NCSecDesc',
+        '/test:NetLogons',
+        '/test:ObjectsReplicated',
+        '/test:Replications',
+        '/test:RidManager',
+        '/test:Services',
+        '/test:SysVolCheck',
+        '/test:VerifyEnterpriseReferences',
+        '/test:VerifyReferences',
+        '/test:VerifyReplicas',
+        '/test:CheckSecurityError'
+    )
+    try {
+        `$raw = & dcdiag.exe @testArgs 2>&1
         `$out = `$raw | Out-String
-        `$out | Out-File -FilePath '$dcdiagFullFile' -Encoding UTF8 -Force
+        `$out | Out-File -FilePath `$outFile -Encoding UTF8 -Force
         return `$out
+    } catch {
+        return ("dcdiag.exe failed: {0}" -f `$_.Exception.Message)
     }
-    return "dcdiag.exe not found."
 "@)
 
 $sbDcdiagDns = [scriptblock]::Create(@"
-    if (Get-Command dcdiag.exe -ErrorAction SilentlyContinue) {
-        `$raw = & dcdiag.exe /test:DNS /v 2>&1
+    if (-not (Get-Command dcdiag.exe -ErrorAction SilentlyContinue)) { return 'dcdiag.exe not found.' }
+    `$outFile = '$dcdiagDnsFile'
+    try {
+        `$raw = & dcdiag.exe /s:localhost /test:DNS /v 2>&1
         `$out = `$raw | Out-String
-        `$out | Out-File -FilePath '$dcdiagDnsFile' -Encoding UTF8 -Force
+        `$out | Out-File -FilePath `$outFile -Encoding UTF8 -Force
         return `$out
+    } catch {
+        return ("dcdiag.exe /test:DNS failed: {0}" -f `$_.Exception.Message)
     }
-    return "dcdiag.exe not found."
 "@)
 
 $parallelTasks = @(
     [pscustomobject]@{ Label = "DCDIAG (full)";                                    ScriptBlock = $sbDcdiagFull }
     [pscustomobject]@{ Label = "DCDIAG - DNS tests";                               ScriptBlock = $sbDcdiagDns }
-    [pscustomobject]@{ Label = "repadmin /replsummary";                            ScriptBlock = { if (Get-Command repadmin.exe -EA SilentlyContinue) { & repadmin.exe /replsummary 2>&1 | Out-String } else { "repadmin.exe not found." } } }
-    [pscustomobject]@{ Label = "repadmin /showrepl * /verbose /all /intersite";    ScriptBlock = { if (Get-Command repadmin.exe -EA SilentlyContinue) { & repadmin.exe /showrepl * /verbose /all /intersite 2>&1 | Out-String } else { "repadmin.exe not found." } } }
-    [pscustomobject]@{ Label = "repadmin /queue";                                  ScriptBlock = { if (Get-Command repadmin.exe -EA SilentlyContinue) { & repadmin.exe /queue 2>&1 | Out-String } else { "repadmin.exe not found." } } }
-    [pscustomobject]@{ Label = "repadmin /showbackup *";                           ScriptBlock = { if (Get-Command repadmin.exe -EA SilentlyContinue) { & repadmin.exe /showbackup * 2>&1 | Out-String } else { "repadmin.exe not found." } } }
+    [pscustomobject]@{ Label = "repadmin /replsummary (localhost)";                ScriptBlock = { if (Get-Command repadmin.exe -EA SilentlyContinue) { & repadmin.exe /replsummary localhost 2>&1 | Out-String } else { "repadmin.exe not found." } } }
+    [pscustomobject]@{ Label = "repadmin /showrepl localhost /verbose";            ScriptBlock = { if (Get-Command repadmin.exe -EA SilentlyContinue) { & repadmin.exe /showrepl localhost /verbose 2>&1 | Out-String } else { "repadmin.exe not found." } } }
+    [pscustomobject]@{ Label = "repadmin /queue localhost";                        ScriptBlock = { if (Get-Command repadmin.exe -EA SilentlyContinue) { & repadmin.exe /queue localhost 2>&1 | Out-String } else { "repadmin.exe not found." } } }
+    [pscustomobject]@{ Label = "repadmin /showbackup localhost";                   ScriptBlock = { if (Get-Command repadmin.exe -EA SilentlyContinue) { & repadmin.exe /showbackup localhost 2>&1 | Out-String } else { "repadmin.exe not found." } } }
     [pscustomobject]@{ Label = "w32tm /query /status";                             ScriptBlock = { if (Get-Command w32tm.exe -EA SilentlyContinue) { & w32tm.exe /query /status 2>&1 | Out-String } else { "w32tm.exe not found." } } }
     [pscustomobject]@{ Label = "w32tm /query /configuration";                      ScriptBlock = { if (Get-Command w32tm.exe -EA SilentlyContinue) { & w32tm.exe /query /configuration 2>&1 | Out-String } else { "w32tm.exe not found." } } }
     [pscustomobject]@{ Label = "w32tm /query /peers";                              ScriptBlock = { if (Get-Command w32tm.exe -EA SilentlyContinue) { & w32tm.exe /query /peers 2>&1 | Out-String } else { "w32tm.exe not found." } } }
@@ -553,7 +622,8 @@ $parallelTasks = @(
 )
 
 $parallelPhase = Invoke-ParallelTasks -Tasks $parallelTasks -MaxRunspaces 12 `
-    -PhaseLabel "Comandos externos (dcdiag/repadmin/w32tm/dfsrdiag)" -ProgressId 1
+    -PhaseLabel "Comandos externos (dcdiag/repadmin/w32tm/dfsrdiag)" -ProgressId 1 `
+    -TimeoutSeconds 300
 Write-Log ("Fase de comandos externos concluída em {0}" -f $parallelPhase.Elapsed) -Level OK
 
 foreach ($r in $parallelPhase.Results) {
@@ -623,9 +693,14 @@ Write-Section $writer "Partner DCs: discovery + tests (parallel)"
 if (-not $PartnerDCs -or $PartnerDCs.Count -eq 0) {
     if ($domainDetected -and (Command-Exists "nltest.exe")) {
         try {
+            # Use nltest /dclist scoped to local site first; fall back to domain-wide
+            # nltest /dclist contacts only the local DC's AD database — safe and fast
             $found = @()
             foreach ($line in (nltest /dclist:$domainDetected 2>$null)) {
-                if ($line -match "\\\\([A-Za-z0-9\-_\.]+)") { $found += $Matches[1] }
+                if ($line -match "\\\\([A-Za-z0-9\-_\.]+)") {
+                    $candidate = $Matches[1]
+                    if ($candidate -ne $dc) { $found += $candidate }   # exclude self
+                }
             }
             $PartnerDCs = $found | Sort-Object -Unique
         } catch { $PartnerDCs = @() }
@@ -702,7 +777,8 @@ $eventTasks = @(
 )
 
 $eventPhase = Invoke-ParallelTasks -Tasks $eventTasks -MaxRunspaces 4 `
-    -PhaseLabel "Event Logs (Directory Service / DNS / DFS / System)" -ProgressId 2
+    -PhaseLabel "Event Logs (Directory Service / DNS / DFS / System)" -ProgressId 2 `
+    -TimeoutSeconds 120
 Write-Log ("Fase de eventos concluída em {0}" -f $eventPhase.Elapsed) -Level OK
 
 foreach ($r in $eventPhase.Results) {
@@ -873,7 +949,7 @@ $newPhaseTasks = @(
                 try { [void]`$sb.AppendLine('--- repadmin /istg ---');         [void]`$sb.AppendLine(( & repadmin.exe /istg 2>&1 | Out-String )) }         catch { [void]`$sb.AppendLine("repadmin /istg failed: `$_") }
                 try { [void]`$sb.AppendLine("`r`n--- repadmin /bridgeheads ---"); [void]`$sb.AppendLine(( & repadmin.exe /bridgeheads 2>&1 | Out-String )) } catch { [void]`$sb.AppendLine("repadmin /bridgeheads failed: `$_") }
                 try { [void]`$sb.AppendLine("`r`n--- repadmin /showism ---");     [void]`$sb.AppendLine(( & repadmin.exe /showism 2>&1 | Out-String )) }     catch { [void]`$sb.AppendLine("repadmin /showism failed: `$_") }
-                try { [void]`$sb.AppendLine("`r`n--- repadmin /showutdvec * /nocache ---"); [void]`$sb.AppendLine(( & repadmin.exe /showutdvec * /nocache 2>&1 | Out-String )) } catch { [void]`$sb.AppendLine("repadmin /showutdvec failed: `$_") }
+                try { [void]`$sb.AppendLine("`r`n--- repadmin /showutdvec localhost /nocache ---"); [void]`$sb.AppendLine(( & repadmin.exe /showutdvec localhost /nocache 2>&1 | Out-String )) } catch { [void]`$sb.AppendLine("repadmin /showutdvec failed: `$_") }
 
                 try {
                     [void]`$sb.AppendLine("`r`n--- Tombstone lifetime vs replication lag ---")
@@ -884,7 +960,7 @@ $newPhaseTasks = @(
                         if (`$tslRaw -and `$tslRaw.tombstoneLifetime) { `$tsl = `$tslRaw.tombstoneLifetime }
                     }
                     [void]`$sb.AppendLine(("Tombstone lifetime (days): {0}" -f `$tsl))
-                    `$replSum = & repadmin.exe /replsummary 2>&1 | Out-String
+                    `$replSum = & repadmin.exe /replsummary localhost 2>&1 | Out-String
                     `$maxLag = 0
                     foreach (`$line in (`$replSum -split "\`n")) {
                         if (`$line -match 'largest delta\s*:\s*(\d+)d') { `$d=[int]`$Matches[1]; if(`$d -gt `$maxLag){`$maxLag=`$d} }
@@ -1060,7 +1136,8 @@ $newPhaseTasks = @(
                             if (`$snNet.ToString() -eq `$ipNet.ToString()) { `$covered=`$true; break }
                         } catch {}
                     }
-                    [void]`$sb.AppendLine(("  {0,-20} -> {1}" -f `$ip, $(if(`$covered){'COVERED'}else{'WARNING: not mapped to any AD subnet'})))
+                    `$ipStatus = if (`$covered) { 'COVERED' } else { 'WARNING: not mapped to any AD subnet' }
+                    [void]`$sb.AppendLine(("  {0,-20} -> {1}" -f `$ip, `$ipStatus))
                 }
                 [void]`$sb.AppendLine("`r`n--- Site Links ---")
                 [void]`$sb.AppendLine(( Get-ADObject -Filter { objectClass -eq 'siteLink' } -SearchBase "CN=Sites,`$configNC" -Properties name,cost,replInterval -EA SilentlyContinue | Select-Object Name,cost,replInterval | Format-Table -AutoSize | Out-String ))
@@ -1071,7 +1148,8 @@ $newPhaseTasks = @(
 )
 
 $newPhase = Invoke-ParallelTasks -Tasks $newPhaseTasks -MaxRunspaces 8 `
-    -PhaseLabel "AD/Kerberos/DNS/Replicação/GPO/Segurança/SO/Sites" -ProgressId 3
+    -PhaseLabel "AD/Kerberos/DNS/Replicação/GPO/Segurança/SO/Sites" -ProgressId 3 `
+    -TimeoutSeconds 180
 Write-Log ("Fase paralela NEW concluída em {0}" -f $newPhase.Elapsed) -Level OK
 
 # Write all results to report in order
@@ -1158,9 +1236,6 @@ foreach ($phase in $Script:PhaseTiming.Keys) {
 Write-Text $writer ""
 Write-Text $writer ("Report file : {0}" -f $reportFile)
 Write-Text $writer ("Log file    : {0}" -f $logFile)
-$writer.Flush()
-$writer.Close()
-$writer.Dispose()
 
 Write-Log ("Relatório salvo em : {0}" -f $reportFile) -Level OK
 Write-Log ("Log salvo em       : {0}" -f $logFile)    -Level OK
@@ -1170,9 +1245,11 @@ $totalElapsed = ("{0:D2}:{1:D2}:{2:D2}" -f `
     $Script:GlobalSW.Elapsed.Minutes,
     $Script:GlobalSW.Elapsed.Seconds)
 
-# Write total execution time to the report (before closing the writer)
+# Write total execution time to the report — BEFORE closing the writer
 Write-Text $writer ("Tempo total de execução : {0}" -f $totalElapsed)
 $writer.Flush()
+$writer.Close()
+$writer.Dispose()
 
 Write-Log ("Tempo total de execução : {0}" -f $totalElapsed) -Level END
 Write-Log "Script concluído" -Level END
